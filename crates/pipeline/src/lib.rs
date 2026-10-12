@@ -82,6 +82,8 @@ pub enum ColourBasis {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ColourSource {
     pub basis: ColourBasis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_profile: Option<String>,
     pub monochrome_tone: bool,
     pub dro_tone_removed: bool,
 }

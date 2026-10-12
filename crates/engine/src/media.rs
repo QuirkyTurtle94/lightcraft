@@ -142,6 +142,8 @@ pub struct DenoiseSpec {
 
 /// Decodes a raw file once and develops it twice: as usual, and from the denoised picture in `spec` when that can be
 /// read (`None` when it cannot). Both are at most `max_edge` long and the same size.
+pub type SelectedLoader = Arc<dyn Fn(&str, usize, &str, Option<&DenoiseSpec>) -> Result<(Rgb32f, Option<Rgb32f>, SourceInfo), String> + Send + Sync>;
+
 pub type PairLoader = Arc<dyn Fn(&str, usize, &DenoiseSpec) -> Result<(Rgb32f, Option<Rgb32f>, SourceInfo), String> + Send + Sync>;
 
 /// A photo's denoised picture next to its plain one, and the last mix of the two that was asked for.
@@ -322,6 +324,8 @@ pub struct MediaCache {
     /// share of [`crate::memory::budget`]); the least recently used entry of any of them goes first.
     budget: usize,
     pub file_loader: Option<FileLoader>,
+    pub selected_loader: Option<SelectedLoader>,
+    source_versions: Lru<PhotoId, Hash128>,
     pub file_probe: Option<FileProbe>,
     pub preview_loader: Option<PreviewLoader>,
     /// Reads a photo file's bytes (Photo Merge); `None` = the local file system.
@@ -397,6 +401,8 @@ impl Default for MediaCache {
             preview_capacity: 0,
             budget,
             file_loader: None,
+            selected_loader: None,
+            source_versions: Lru::new(64 << 10),
             file_probe: None,
             preview_loader: None,
             file_bytes: None,
@@ -619,9 +625,31 @@ impl MediaCache {
     }
 
     fn source_ref_with(&mut self, p: &Photo, level: SourceLevel, cached: bool) -> SourceRef {
+        let key = decoded_key(p);
+        if self.source_versions.peek(&p.id) != Some(&key) {
+            self.forget(p.id);
+            self.source_versions.insert(p.id, key, 48);
+        }
         let mut r = self.source_ref_plain(p, level, cached);
         if let (SourceRef::File { denoise, .. }, Some((spec, loader))) = (&mut r, self.denoise.get(p.id)) {
             *denoise = Some((spec.clone(), loader.clone()));
+        }
+        if !p.develop.profile.camera.is_empty()
+            && let SourceRef::File { loader, denoise, .. } = &mut r
+        {
+            let selected = self.selected_loader.clone();
+            let choice = p.develop.profile.camera.clone();
+            *loader = Some(Arc::new(move |path, edge| {
+                let load = selected.as_ref().ok_or("this host cannot load a chosen camera profile")?;
+                load(path, edge, &choice, None).map(|(img, _, info)| (img, info))
+            }));
+            if let Some((_, pair)) = denoise {
+                let selected = self.selected_loader.clone();
+                let choice = p.develop.profile.camera.clone();
+                *pair = Arc::new(move |path, edge, spec| {
+                    selected.as_ref().ok_or("this host cannot load a chosen camera profile")?(path, edge, &choice, Some(spec))
+                });
+            }
         }
         r
     }
@@ -1087,13 +1115,15 @@ impl crate::Session {
         } else {
             source_edge_needed(&p, &settings, apply_crop, max_w.max(max_h))
         });
-        let source = self.media.source_ref(&p, level);
+        let mut decoded_photo = p.clone();
+        Arc::make_mut(&mut decoded_photo).develop = settings.clone();
+        let source = self.media.source_ref(&decoded_photo, level);
         let request = RenderRequest { apply_crop, ..RenderRequest::fit(max_w, max_h) };
         // the photo id is part of the key: two photos with the same settings and size must not
         // share a result (a view slot showing photo A would otherwise look current for photo B)
         // …and so is the file's content: a file changed on disk (Reload) renders afresh
         let content_key = content_key(&p);
-        let source_key = Hasher128::new().str(&content_key).finish();
+        let source_key = decoded_key(&decoded_photo);
         let content = source_key.0 as u64;
         // Temporary "before" settings must not replace the photo's cached develop hash.
         let settings_hash = if before { settings.hash64() } else { self.media.settings_hashes.get(id, &settings) };
@@ -1139,7 +1169,16 @@ impl crate::Session {
     pub fn preview_job(&mut self, id: PhotoId, max_w: usize, max_h: usize, apply_crop: bool, settings: &DevelopSettings) -> Option<RenderJob> {
         let mut job = self.render_job(id, max_w, max_h, false, apply_crop)?;
         job.settings = Arc::new(settings.clone());
-        job.key = settings.hash64() ^ ((max_w as u64) << 40) ^ ((max_h as u64) << 20) ^ (apply_crop as u64) ^ (job.level as u64) << 60;
+        let mut photo = self.catalog.photo(id)?.clone();
+        Arc::make_mut(&mut photo).develop = job.settings.clone();
+        job.source = self.media.source_ref(&photo, job.level);
+        job.source_key = Some(decoded_key(&photo));
+        job.key = settings.hash64()
+            ^ ((max_w as u64) << 40)
+            ^ ((max_h as u64) << 20)
+            ^ (apply_crop as u64)
+            ^ (job.level as u64) << 60
+            ^ decoded_key(&photo).0 as u64;
         Some(job)
     }
 
@@ -1161,7 +1200,8 @@ impl crate::Session {
     /// hash, so a variant renders once; `key` is derived from the same hash, so a frontend can
     /// keep one texture per variant.
     pub fn variant_job(&mut self, id: PhotoId, settings: &DevelopSettings, edge: usize) -> Option<RenderJob> {
-        let p = self.catalog.photo(id)?.clone();
+        let mut p = self.catalog.photo(id)?.clone();
+        Arc::make_mut(&mut p).develop = Arc::new(settings.clone());
         let edge = edge.clamp(16, SourceLevel::Thumb.max_edge());
         let level = SourceLevel::Thumb;
         let source = self.media.source_ref(&p, level);
@@ -1169,7 +1209,7 @@ impl crate::Session {
         Some(RenderJob {
             request_id: 0,
             cache_generation: self.media.rendered.generation(),
-            source_key: Some(Hasher128::new().str(&content_key(&p)).finish()),
+            source_key: Some(decoded_key(&p)),
             photo: id,
             level,
             source,
@@ -1215,7 +1255,7 @@ impl crate::Session {
         Some(RenderJob {
             request_id: 0,
             cache_generation: self.media.rendered.generation(),
-            source_key: Some(Hasher128::new().str(&content_key(&p)).finish()),
+            source_key: Some(decoded_key(&p)),
             photo: id,
             level,
             source,
@@ -1387,7 +1427,7 @@ impl crate::Session {
     pub fn accept(&mut self, r: &RenderResult) {
         if r.rendered.is_ok()
             && let (Some(key), Some(source)) = (r.source_key, &r.colour_source)
-            && self.catalog.photo(r.photo).is_some_and(|p| Hasher128::new().str(&content_key(p)).finish() == key)
+            && self.catalog.photo(r.photo).is_some_and(|p| decoded_key(p) == key)
         {
             let cost = 128
                 + match &source.basis {
@@ -1397,10 +1437,13 @@ impl crate::Session {
             self.media.remote_colour.insert(r.photo, (key, source.clone()), cost);
         }
         if let Some(src) = &r.loaded
-            && r.source_key.is_none_or(|key| self.catalog.photo(r.photo).is_some_and(|p| Hasher128::new().str(&content_key(p)).finish() == key))
+            && r.source_key.is_none_or(|key| self.catalog.photo(r.photo).is_some_and(|p| decoded_key(p) == key))
         {
             if let Some(info) = &src.info {
                 self.learn_as_shot_wb(r.photo, info);
+            }
+            if let Some(p) = self.catalog.photo(r.photo) {
+                self.media.source_versions.insert(r.photo, decoded_key(p), 48);
             }
             self.media.insert_source(r.photo, r.level, src.clone());
         }
@@ -1464,6 +1507,14 @@ impl crate::Session {
             let p = self.catalog.photo(id).ok_or("no such photo")?.clone();
             job.source = self.media.source_ref_uncached(&p, job.level);
             if let SourceRef::File { denoise, .. } = &mut job.source {
+                let mut wanted = wanted;
+                if !p.develop.profile.camera.is_empty() {
+                    let loader = self.media.selected_loader.clone();
+                    let choice = p.develop.profile.camera.clone();
+                    wanted.1 = Arc::new(move |path, edge, spec| {
+                        loader.as_ref().ok_or("this host cannot load a chosen camera profile")?(path, edge, &choice, Some(spec))
+                    });
+                }
                 *denoise = Some(wanted);
             }
         }
@@ -1476,10 +1527,11 @@ impl crate::Session {
     /// Prefer decoder facts to header-only metadata for pixel-statistics commands.
     pub fn source_info(&self, id: PhotoId) -> SourceInfo {
         let header = self.catalog.photo(id).map(|p| source_info(p)).unwrap_or_default();
-        let mut info = self.media.source_facts(id, header);
+        let current = self.catalog.photo(id).is_some_and(|p| self.media.source_versions.peek(&id) == Some(&decoded_key(p)));
+        let mut info = if current { self.media.source_facts(id, header) } else { header };
         if info.colour_source.is_none()
             && let Some((key, source)) = self.media.remote_colour.peek(&id)
-            && self.catalog.photo(id).is_some_and(|p| Hasher128::new().str(&content_key(p)).finish() == *key)
+            && self.catalog.photo(id).is_some_and(|p| decoded_key(p) == *key)
         {
             info.colour_source = Some(source.clone());
         }
@@ -1525,6 +1577,11 @@ pub struct ProbeInfo {
 
 pub type FileProbe = Arc<dyn Fn(&str) -> Result<ProbeInfo, String> + Send + Sync>;
 
+/// Identity of decoded pixels, including starting colour and the installed profile revision.
+pub fn decoded_key(p: &Photo) -> Hash128 {
+    Hasher128::new().str(&content_key(p)).str(&p.develop.profile.camera).u64(crate::camera_profiles::cache_key()).finish()
+}
+
 #[cfg(test)]
 mod thumbnail_hash_tests {
     use super::*;
@@ -1543,7 +1600,7 @@ mod thumbnail_hash_tests {
             let b = thumb_bucket(edge);
             // Independent original formula: never asks the new hash cache for expected values.
             let settings = p.develop.hash64();
-            let content = Hasher128::new().str(&content_key(&p)).finish().0 as u64;
+            let content = decoded_key(&p).0 as u64;
             let expected =
                 settings ^ ((b as u64) << 40) ^ ((b as u64) << 20) ^ 1 ^ p.id.0.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ content.rotate_left(17);
             let disk = Hasher128::new()
@@ -1660,8 +1717,12 @@ mod tests {
         let id = s.active().unwrap();
         let mut result = s.loupe_job(id, 32, 32, true).unwrap().run();
         result.loaded = None; // Workers retain their pixels in a separate address space.
-        let source =
-            lightcraft_pipeline::ColourSource { basis: lightcraft_pipeline::ColourBasis::Spectral, monochrome_tone: false, dro_tone_removed: false };
+        let source = lightcraft_pipeline::ColourSource {
+            basis: lightcraft_pipeline::ColourBasis::Spectral,
+            missing_profile: None,
+            monochrome_tone: false,
+            dro_tone_removed: false,
+        };
         result.colour_source = Some(source.clone());
         let current_key = result.source_key;
         result.source_key = None;
@@ -1688,8 +1749,12 @@ mod tests {
             [x, (x * 2.0).min(0.9)]
         }))
         .unwrap();
-        let colour_source =
-            lightcraft_pipeline::ColourSource { basis: lightcraft_pipeline::ColourBasis::Spectral, monochrome_tone: false, dro_tone_removed: false };
+        let colour_source = lightcraft_pipeline::ColourSource {
+            basis: lightcraft_pipeline::ColourBasis::Spectral,
+            missing_profile: None,
+            monochrome_tone: false,
+            dro_tone_removed: false,
+        };
         let info =
             SourceInfo { raw: true, relative_wb: true, camera_tone: Some(tone), colour_source: Some(colour_source.clone()), ..Default::default() };
         let mut s = crate::Session::with_demo();

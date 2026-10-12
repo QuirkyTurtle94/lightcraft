@@ -197,3 +197,42 @@ inferring it from the model or reusing the previous photo's label.
 Browser render workers return the same provenance without transferring decoded pixels. The
 main thread keeps a bounded diagnostic cache keyed by photo and original identity; replacing
 the file or clearing sources discards it. Cached JPEG thumbnails alone cannot establish provenance.
+
+
+## Camera profile wizard (#1315)
+
+Photo → Build Camera Profile (also below the Profile panel's starting-colour readout) runs
+local calibration on selected RAWs, the current collection, or a folder. Use varied scenes in
+one picture style, preferably Standard with DRO off. Style metadata is not currently exposed,
+so the wizard warns that it cannot verify or automatically split mixed styles. No images or
+statistics are uploaded. Optional aggregate-pair export remains a follow-up to #1319.
+
+The background job samples at most 300 RAWs, decodes one at a time through the memory gate,
+and keeps at most 4,000 colour pairs per training photo. Identical files are deduplicated by
+content. Every fifth usable, distinct whole photo is held out: none of its pairs enters the
+pooled matrix/table fit. At least five training photos and one holdout are required (choose
+seven or more). Validation compares mean per-photo gamma-encoded RGB RMS against each
+camera JPEG, excluding clipped sensor pixels, using the normal accepted-look/fallback path
+and per-photo tone fit for both the captured current profile and the proposed profile. This
+is a camera-JPEG agreement check, not chart-measured colour accuracy. Failure to improve
+requires an explicit override before installation. Cancel takes effect between RAWs and fits;
+activity remains visible after the dialog closes.
+
+Installation adds an immutable `cp-<content hash>.json` profile to the existing camera-profiles
+folder; it does not silently change the model default. Several named profiles can coexist.
+The wizard can set the model default, remove/restore profiles, or reload files without an app
+restart. `camera-defaults.json` maps exact camera model strings to their defaults; legacy
+`<model>.json` profiles continue to work when no named default is selected. A malformed defaults
+file is preserved and must be repaired before changing a default.
+
+The Profile panel can choose Model default, Built in, or a named profile for one photo and
+apply that choice to a selection. This changes the undoable `profile.camera` develop setting,
+which round-trips through catalog JSON and LightCraft's XMP settings. Empty means model default;
+`builtin` bypasses local overrides. A missing or removed named choice falls back to the built-in
+profile (and then the normal per-photo/spectral/neutral path), with an explicit diagnostic.
+Decoded-source identity and render keys include the selected profile and installation revision;
+stale in-flight results cannot replace the current source. The web renderer preserves choices
+but reports unavailable local profiles and uses its built-in fallback; calibration itself is native.
+
+Commands: `cameraProfile.start`, `.status`, `.cancel`, `.install`, `.list`, `.choose`, `.default`,
+`.remove` (with `removed: false` to restore), and `.reload`. All wizard actions use these commands.

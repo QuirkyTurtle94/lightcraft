@@ -33,6 +33,8 @@ pub const BUNDLED: &[(&str, &str)] = &[
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CameraProfile {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     pub version: u32,
     /// The camera model as the files report it (Exif `Model`), e.g. `ILCE-7M4`.
     pub model: String,
@@ -47,7 +49,7 @@ pub struct CameraProfile {
 
 impl CameraProfile {
     pub fn new(model: &str, files: usize, samples: usize, matrix: Mat3, hue_sat: Option<HsvTable>) -> CameraProfile {
-        CameraProfile { version: VERSION, model: model.to_owned(), files, samples, matrix: matrix.0, hue_sat }
+        CameraProfile { name: String::new(), version: VERSION, model: model.to_owned(), files, samples, matrix: matrix.0, hue_sat }
     }
 
     pub fn matrix(&self) -> Mat3 {
@@ -55,7 +57,7 @@ impl CameraProfile {
     }
 
     /// Whether the data is usable (bounded matrix, table shape matching its data).
-    fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         let matrix = self.matrix.iter().flatten().all(|v| v.is_finite() && v.abs() < 8.0) && Mat3(self.matrix).inverse().is_some();
         let table = self.hue_sat.as_ref().is_none_or(|t| {
             let dims = (1..=4096).contains(&t.hue_divisions) && (2..=4096).contains(&t.sat_divisions) && (1..=4096).contains(&t.val_divisions);
@@ -100,7 +102,7 @@ fn parse(json: &[u8], origin: &str) -> Result<CameraProfile, String> {
 }
 
 /// The built-in profile for `model`, if any.
-fn bundled(model: &str) -> Option<CameraProfile> {
+pub(crate) fn bundled(model: &str) -> Option<CameraProfile> {
     let (_, json) = BUNDLED.iter().find(|(m, _)| *m == model)?;
     parse(json.as_bytes(), &format!("built-in profile {model}")).inspect_err(|e| eprintln!("lightcraft: ignoring camera profile {e}")).ok()
 }
@@ -135,6 +137,10 @@ pub fn get(model: &str) -> Option<Arc<CameraProfile>> {
 
 /// The profile and the origin of the exact cached data used by the fitter.
 pub fn resolved(model: &str) -> Option<ResolvedProfile> {
+    crate::camera_profile_store::resolve(model, "").0
+}
+
+pub(crate) fn resolved_legacy(model: &str) -> Option<ResolvedProfile> {
     let model = model.trim();
     if model.is_empty() {
         return None;
@@ -171,7 +177,7 @@ fn resolve_from(model: &str, directory: Option<&Path>) -> Option<ResolvedProfile
 /// keys, so thumbnails rendered before a profile existed are not reused after.
 pub fn cache_key() -> u64 {
     static KEY: OnceLock<u64> = OnceLock::new();
-    *KEY.get_or_init(|| {
+    KEY.get_or_init(|| {
         let entries = dir().and_then(|d| std::fs::read_dir(d).ok());
         let mut files: Vec<(String, u64, u64)> = entries
             .into_iter()
@@ -194,6 +200,7 @@ pub fn cache_key() -> u64 {
         }
         h.finish().0 as u64
     })
+    .wrapping_add(REVISION.load(std::sync::atomic::Ordering::Acquire))
 }
 
 /// Per camera model: the photos read and their pooled colour pairs.
@@ -250,6 +257,15 @@ impl Pool {
         v.sort();
         v
     }
+}
+
+static REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Reload profiles after an explicit install, removal, or default change; new jobs get new keys.
+pub fn reload() {
+    crate::camera_profile_store::clear_cache();
+    cache().lock().unwrap_or_else(PoisonError::into_inner).clear();
+    REVISION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 }
 
 #[cfg(test)]

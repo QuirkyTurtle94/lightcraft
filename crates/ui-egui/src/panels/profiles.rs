@@ -214,7 +214,7 @@ fn cell_ui(
 }
 
 /// Read from the selected photo's decoded source, never from the previously displayed preview.
-pub(super) fn colour_source(app: &LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
+pub(super) fn colour_source(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
     if !app.session.catalog.photo(id).is_some_and(|p| p.develops_raw()) {
         return;
     }
@@ -223,6 +223,7 @@ pub(super) fn colour_source(app: &LightcraftApp, ui: &mut egui::Ui, id: PhotoId)
     let t = Tokens::get(ui.ctx());
     let response = ui.add(egui::Label::new(egui::RichText::new(text).font(t.font(12.0)).color(t.text_dim)).wrap());
     register(ui.ctx(), "label:cameraColourSource", response.rect);
+    super::calibration::chooser(app, ui, id);
 }
 
 fn colour_source_text(source: Option<&lightcraft_pipeline::ColourSource>) -> String {
@@ -242,6 +243,9 @@ fn colour_source_text(source: Option<&lightcraft_pipeline::ColourSource>) -> Str
         ColourBasis::Spectral => crate::i18n::tr("Camera colour: spectral sensitivities (no accepted colour fit)").to_string(),
         ColourBasis::Neutral => crate::i18n::tr("Camera colour: neutral (no accepted colour fit)").to_string(),
     };
+    if source.missing_profile.is_some() {
+        label.push_str(" · Chosen profile unavailable; using built-in fallback");
+    }
     if source.monochrome_tone {
         label.push_str(" · ");
         label.push_str(crate::i18n::tr("Tone from black-and-white camera JPEG"));
@@ -281,7 +285,7 @@ mod tests {
                 lightcraft_raster::Rgb32f::new(32, 32),
                 SourceInfo {
                     raw: true,
-                    colour_source: Some(ColourSource { basis, monochrome_tone: false, dro_tone_removed: false }),
+                    colour_source: Some(ColourSource { basis, missing_profile: None, monochrome_tone: false, dro_tone_removed: false }),
                     ..Default::default()
                 },
             ))

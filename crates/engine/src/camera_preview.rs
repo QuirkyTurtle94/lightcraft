@@ -78,8 +78,31 @@ pub(crate) fn file_local_look(format: RawFormat) -> bool {
 /// white (a monochrome picture style) has no colour to fit, but still gives its tone curve: with the camera profile's
 /// colour in [`fit_preview`], else on top of the spectral matrices or the fallback ([`monochrome_look`]). Returns the
 /// as-shot white, the camera transform at it and the fitted look.
+#[cfg(test)]
 pub(crate) fn starting_colour(raw: &mut RawImage, bytes: &[u8]) -> (Xy, CameraTransform, Option<CameraLook>, ColourSource) {
-    starting_colour_with(raw, |raw, t| fit_preview(raw, bytes, t), |raw, t| monochrome_look(raw, bytes, t))
+    starting_colour_selected(raw, bytes, "")
+}
+
+pub(crate) fn starting_colour_selected(raw: &mut RawImage, bytes: &[u8], selection: &str) -> (Xy, CameraTransform, Option<CameraLook>, ColourSource) {
+    let (profile, missing) = raw.metadata.model.as_deref().map(|m| crate::camera_profile_store::resolve(m, selection)).unwrap_or_default();
+    let (xy, transform, look, mut source) = starting_colour_profile(raw, bytes, profile.as_ref());
+    source.missing_profile = missing;
+    (xy, transform, look, source)
+}
+
+fn starting_colour_profile(
+    raw: &mut RawImage,
+    bytes: &[u8],
+    profile: Option<&crate::camera_profiles::ResolvedProfile>,
+) -> (Xy, CameraTransform, Option<CameraLook>, ColourSource) {
+    let (xy, t, look, mut source) =
+        starting_colour_with(raw, |r, t| fit_preview_profile(r, bytes, t, profile.map(|p| p.profile.as_ref())), |r, t| monochrome_look(r, bytes, t));
+    if look.as_ref().is_some_and(|l| l.provenance.profile)
+        && let Some(p) = profile
+    {
+        source.basis = ColourBasis::CameraProfile { model: p.profile.model.clone(), local: p.local };
+    }
+    (xy, t, look, source)
 }
 
 /// [`starting_colour`] with the JPEG fit (the look, and whether the JPEG is black and white) and the black-and-white
@@ -95,7 +118,12 @@ fn starting_colour_with(
     };
     let (xy, t) = start(raw);
     if !t.matrix_is_fallback {
-        return (xy, t, None, ColourSource { basis: ColourBasis::FileMatrices, monochrome_tone: false, dro_tone_removed: false });
+        return (
+            xy,
+            t,
+            None,
+            ColourSource { basis: ColourBasis::FileMatrices, missing_profile: None, monochrome_tone: false, dro_tone_removed: false },
+        );
     }
     let (look, black_and_white) = fit(raw, &t);
     if let Some(look) = look {
@@ -111,7 +139,8 @@ fn starting_colour_with(
         } else {
             ColourBasis::CameraJpeg
         };
-        let source = ColourSource { basis, monochrome_tone: black_and_white, dro_tone_removed: look.provenance.dro_tone_removed };
+        let source =
+            ColourSource { basis, missing_profile: None, monochrome_tone: black_and_white, dro_tone_removed: look.provenance.dro_tone_removed };
         return (xy, t, Some(look), source);
     }
     let (xy, t) = match raw.metadata.model.as_deref().and_then(|model| lightcraft_raw::spectral::find(raw.metadata.make.as_deref(), model)) {
@@ -128,6 +157,7 @@ fn starting_colour_with(
     let look = if black_and_white { monochrome(raw, &t) } else { None };
     let source = ColourSource {
         basis: if t.matrix_is_fallback { ColourBasis::Neutral } else { ColourBasis::Spectral },
+        missing_profile: None,
         monochrome_tone: look.is_some(),
         dro_tone_removed: look.as_ref().is_some_and(|look| look.provenance.dro_tone_removed),
     };
@@ -135,7 +165,18 @@ fn starting_colour_with(
 }
 
 /// The look fitted to the file's camera JPEG, and whether that JPEG is black and white ([`monochrome`]).
+#[cfg(test)]
 pub(crate) fn fit_preview(raw: &RawImage, bytes: &[u8], transform: &CameraTransform) -> (Option<CameraLook>, bool) {
+    let profile = raw.metadata.model.as_deref().and_then(crate::camera_profiles::get);
+    fit_preview_profile(raw, bytes, transform, profile.as_deref())
+}
+
+fn fit_preview_profile(
+    raw: &RawImage,
+    bytes: &[u8],
+    transform: &CameraTransform,
+    profile: Option<&crate::camera_profiles::CameraProfile>,
+) -> (Option<CameraLook>, bool) {
     if !transform.matrix_is_fallback || !file_local_look(raw.format) {
         return (None, false);
     }
@@ -143,7 +184,6 @@ pub(crate) fn fit_preview(raw: &RawImage, bytes: &[u8], transform: &CameraTransf
     let black_and_white = monochrome(&reference);
     // A camera profile pooled from many photos knows colours this photo shows too little of;
     // try its colour first and fit tone/chroma per photo (picture styles vary).
-    let profile = raw.metadata.model.as_deref().and_then(crate::camera_profiles::get);
     let colour = profile.as_ref().and_then(|p| Some((p.matrix().mul(&transform.matrix.inverse()?), p.hue_sat.clone())));
     let look = match fit_look(&sensor, &reference, &clipped, colour.clone()) {
         Some(look) => look,
@@ -1346,6 +1386,48 @@ fn fit_tone_conditional(mut pairs: Vec<(f64, f64)>) -> Option<CameraTone> {
         i += n;
     }
     CameraTone::new(knots)
+}
+
+/// Whole-photo validation, using the same accepted look and fallbacks as a normal decode.
+/// The held-out photo may fit its own tone as usual, but never contributes to the pooled profile.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn validation_rms(
+    raw: &mut RawImage,
+    bytes: &[u8],
+    candidate: &crate::camera_profiles::CameraProfile,
+    current: Option<&crate::camera_profiles::ResolvedProfile>,
+) -> Option<(f64, f64)> {
+    fn error(raw: &mut RawImage, bytes: &[u8], profile: Option<&crate::camera_profiles::ResolvedProfile>) -> Option<f64> {
+        let (_, transform, look, _) = starting_colour_profile(raw, bytes, profile);
+        let (sensor, reference, clipped) = proxies(raw, bytes, &transform, PROXY)?;
+        let tone = look.as_ref().map_or_else(|| ToneMap::new(0.0, 0.0, 0.0), |l| ToneMap::camera(&l.tone, 0.0, 0.0, 0.0));
+        let correction = look.as_ref().and_then(|l| l.hue_sat.as_ref()).and_then(HueSat::new);
+        let mut squared = 0.0;
+        let mut count = 0usize;
+        for ((pixel, target), clipped) in sensor.data.iter().zip(&reference.data).zip(clipped) {
+            if clipped || !pixel.iter().chain(target).all(|v| v.is_finite()) {
+                continue;
+            }
+            let linear = look.as_ref().map_or(pixel.map(f64::from), |l| l.matrix.apply(pixel.map(f64::from)));
+            let linear = correction.as_ref().map_or(linear, |c| c.apply(linear.map(|v| v as f32)).map(f64::from));
+            let rendered = displayed(linear, &tone);
+            for (a, b) in rendered.into_iter().zip(target) {
+                // Display-referred RMS: encode both sides identically.
+                let a = a.clamp(0.0, 1.0).powf(1.0 / 2.2);
+                let b = f64::from(*b).clamp(0.0, 1.0).powf(1.0 / 2.2);
+                squared += (a - b).powi(2);
+                count += 1;
+            }
+        }
+        (count > 0).then(|| (squared / count as f64).sqrt())
+    }
+    let original = raw.color.clone();
+    let before = error(raw, bytes, current);
+    raw.color = original.clone();
+    let proposed = crate::camera_profiles::ResolvedProfile { profile: std::sync::Arc::new(candidate.clone()), local: true };
+    let after = error(raw, bytes, Some(&proposed));
+    raw.color = original;
+    Some((before?, after?))
 }
 
 #[cfg(test)]

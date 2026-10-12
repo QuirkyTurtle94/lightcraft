@@ -181,7 +181,7 @@ impl WorkerCore {
             None => {
                 let src = match (&job.origin, original) {
                     (Source::File { .. }, Some(bytes)) => {
-                        let (image, info) = lightcraft_engine::files::load_bytes(bytes, job.max_edge)?;
+                        let (image, info) = lightcraft_engine::files::load_bytes_selected(bytes, job.max_edge, &job.settings.profile.camera)?;
                         DecodedSource::new(Arc::new(image), Some(info))
                     }
                     (Source::File { path }, None) => return Err(format!("{path}: original not found in browser storage")),
@@ -383,6 +383,7 @@ mod tests {
         assert!(core.colour_source(&wire).is_none());
         let source = ColourSource {
             basis: ColourBasis::CameraProfile { model: "Test Camera".into(), local: false },
+            missing_profile: None,
             monochrome_tone: true,
             dro_tone_removed: true,
         };
