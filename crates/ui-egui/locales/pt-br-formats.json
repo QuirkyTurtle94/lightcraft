@@ -245,6 +245,6 @@
   "{n} added to Apple Photos album “{album}”": "{n} adicionadas ao álbum “{album}” do Fotos da Apple",
   "{n} added to Apple Photos": "{n} adicionadas ao Fotos da Apple",
   "{n} photos opened for editing; each is stacked with its original": "{n} fotos abertas para edição; cada uma está empilhada com a original",
-  "Camera colour: {model} profile (local)": "Camera colour: {model} profile (local)",
-  "Camera colour: {model} profile (built in)": "Camera colour: {model} profile (built in)"
+  "Camera colour: {model} profile (local)": "Cor da câmera: perfil {model} (local)",
+  "Camera colour: {model} profile (built in)": "Cor da câmera: perfil {model} (integrado)"
 }
