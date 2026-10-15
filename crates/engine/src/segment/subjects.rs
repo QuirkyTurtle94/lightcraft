@@ -187,17 +187,19 @@ impl Session {
         }
         let mut d = (*self.develop_of(id).ok_or("Photo unavailable")?).clone();
         let mid = d.next_mask_id();
+        let segs = joined(chosen.iter().map(|c| c.seg.clone()).collect());
         let components = chosen
             .iter()
-            .map(|c| MaskComponent {
+            .zip(segs)
+            .map(|(c, seg)| MaskComponent {
                 name: Some(c.label.clone()),
                 op: MaskOp::Add,
                 invert: false,
                 // one person is an Object selection (+ / − clicks and the detail pass refine that person
                 // alone); a phrase stays a Describe selection
                 shape: match c.click {
-                    Some(at) => MaskShape::Object { hint: vec![at], exclude: Vec::new(), seg: Some(c.seg.clone()), detail: Vec::new(), edge: 0.0 },
-                    None => MaskShape::Prompt { text: c.label.clone(), seg: Some(c.seg.clone()), detail: Vec::new(), edge: 0.0 },
+                    Some(at) => MaskShape::Object { hint: vec![at], exclude: Vec::new(), seg: Some(seg), detail: Vec::new(), edge: 0.0 },
+                    None => MaskShape::Prompt { text: c.label.clone(), seg: Some(seg), detail: Vec::new(), edge: 0.0 },
                 },
             })
             .collect();
@@ -212,6 +214,95 @@ impl Session {
         self.active_mask = Some(mid);
         self.segmenter.subjects.open = false;
         Ok(())
+    }
+}
+
+/// The chosen selections with the seams where they touch closed ([`close_seams`]).
+fn joined(segs: Vec<SegMask>) -> Vec<SegMask> {
+    let side = segs.first().map_or(0, |s| s.side as usize);
+    let logits: Option<Vec<Vec<f32>>> = segs.iter().map(|s| (s.side as usize == side && s.rect.is_none()).then(|| s.logits()).flatten()).collect();
+    match logits {
+        Some(mut logits) if logits.len() > 1 && side > 0 => {
+            close_seams(&mut logits, side);
+            logits.iter().map(|l| SegMask::from_logits(side, l)).collect()
+        }
+        _ => segs,
+    }
+}
+
+/// Widest seam closed, in cells on each side of the weak cell.
+const SEAM: usize = 2;
+/// A cell this far below 0 in every selection is background between them (the floor between two
+/// players), not a seam.
+const BACKGROUND: f32 = -4.0;
+
+/// Closes the seams between selections that touch (two people shoulder to shoulder, a hand on a ball).
+/// Each selection fades out at its own edge, so where two meet their union dips, and the mask shows a
+/// thin line or gap there. A cell weaker than strong cells of two *different* selections at most
+/// [`SEAM`] cells away on opposite sides rises to the weaker of those two (unless it is clearly
+/// background); then where two selections meet, each reaches one cell into the other, so the
+/// interpolated edge between them doesn't dip either. Gaps inside one selection (between a person's
+/// legs), wider ones and clear background between selections stay open.
+fn close_seams(logits: &mut [Vec<f32>], side: usize) {
+    let n = side * side;
+    if logits.iter().any(|l| l.len() != n) {
+        return;
+    }
+    // the strongest selection at each cell (when it is sure) and its logit
+    let union = |logits: &[Vec<f32>]| -> Vec<(Option<usize>, f32)> {
+        (0..n)
+            .map(|i| match logits.iter().enumerate().map(|(k, l)| (k, l[i])).max_by(|a, b| a.1.total_cmp(&b.1)) {
+                Some((k, v)) => ((v > 0.0).then_some(k), v),
+                None => (None, f32::NEG_INFINITY),
+            })
+            .collect()
+    };
+    let at = |x: isize, y: isize| (x >= 0 && y >= 0 && (x as usize) < side && (y as usize) < side).then(|| y as usize * side + x as usize);
+    let u = union(logits);
+    let mut fill: Vec<(usize, usize, f32)> = Vec::new();
+    for (i, (own, v)) in u.iter().enumerate() {
+        if *v <= BACKGROUND {
+            continue;
+        }
+        let (x, y) = ((i % side) as isize, (i / side) as isize);
+        let mut best: Option<(usize, f32)> = None;
+        for (dx, dy) in [(1isize, 0isize), (0, 1), (1, 1), (1, -1)] {
+            for d1 in 1..=SEAM as isize {
+                for d2 in 1..=SEAM as isize {
+                    let (Some(a), Some(b)) = (at(x - dx * d1, y - dy * d1), at(x + dx * d2, y + dy * d2)) else { continue };
+                    if let ((Some(ka), va), (Some(kb), vb)) = (u[a], u[b])
+                        && ka != kb
+                        && va.min(vb) > best.map_or(*v, |b| b.1)
+                    {
+                        best = Some((own.unwrap_or(ka), va.min(vb)));
+                    }
+                }
+            }
+        }
+        if let Some((k, t)) = best {
+            fill.push((i, k, t));
+        }
+    }
+    for (i, k, t) in fill {
+        logits[k][i] = logits[k][i].max(t);
+    }
+    // where two selections meet, each reaches one cell into the other
+    let u = union(logits);
+    let mut grow: Vec<(usize, usize, f32)> = Vec::new();
+    for (i, (own, _)) in u.iter().enumerate() {
+        let Some(kb) = *own else { continue };
+        let (x, y) = ((i % side) as isize, (i / side) as isize);
+        for (dx, dy) in [(-1isize, -1isize), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
+            if let Some(j) = at(x + dx, y + dy)
+                && let (Some(ka), _) = u[j]
+                && ka != kb
+            {
+                grow.push((i, ka, logits[ka][j].min(logits[kb][i])));
+            }
+        }
+    }
+    for (i, k, v) in grow {
+        logits[k][i] = logits[k][i].max(v);
     }
 }
 
@@ -489,5 +580,53 @@ mod tests {
         assert!(c[0].click.is_some_and(|p| p.x < 0.5), "the sharp person is the left one");
         assert_eq!(c.iter().map(|c| c.selected).collect::<Vec<_>>(), [true, false, false]);
         assert!(c[2].focus.is_none() && c[2].click.is_none());
+    }
+
+    /// Two people side by side, their outlines a clear background column apart except where they touch:
+    /// there the seam closes, whether both fade below 0 or stay weakly above it, and the edge between them
+    /// doesn't dip; clear background, the gap between one person's legs and a wide gap stay open.
+    #[test]
+    fn seams_between_touching_selections_close() {
+        let side = 16;
+        let strong = 6.0;
+        let mut a = vec![-8.0f32; side * side];
+        let mut b = vec![-8.0f32; side * side];
+        for y in 0..side {
+            for x in 0..side {
+                let i = y * side + x;
+                // a: columns 0..=6 (with its own 2-cell gap at columns 2..4 in the bottom rows), b: 8..=13
+                if x <= 6 {
+                    a[i] = if y >= 12 && (2..4).contains(&x) { -2.0 } else { strong };
+                }
+                if (8..=13).contains(&x) {
+                    b[i] = strong;
+                }
+            }
+        }
+        // row 5 touches: column 7 weak in both; row 8 touches: a fades weakly above 0 into b
+        a[5 * side + 7] = -1.0;
+        b[5 * side + 7] = -2.0;
+        a[8 * side + 6] = 0.5;
+        b[8 * side + 7] = 0.5;
+        let mut l = vec![a, b];
+        close_seams(&mut l, side);
+        let u = |i: usize| l[0][i].max(l[1][i]);
+        assert!(u(5 * side + 7) >= strong && u(8 * side + 6) >= strong && u(8 * side + 7) >= strong, "the seams close");
+        // halfway between two cells (as the mask is sampled) the union stays as strong as the people
+        let mid = |i: usize, j: usize| ((l[0][i] + l[0][j]) / 2.0).max((l[1][i] + l[1][j]) / 2.0);
+        assert!(mid(5 * side + 7, 5 * side + 8) >= strong && mid(8 * side + 6, 8 * side + 7) >= strong, "the edge between them doesn't dip");
+        assert!(u(3 * side + 7) < 0.0, "clear background between them stays");
+        assert!(u(13 * side + 2) < 0.0, "a gap inside one selection stays");
+        // two selections 4 cells apart: the gap between them stays
+        let mut far = vec![vec![-2.0f32; side * side], vec![-2.0f32; side * side]];
+        for y in 0..side {
+            far[0][y * side + 3] = strong;
+            far[1][y * side + 8] = strong;
+        }
+        close_seams(&mut far, side);
+        assert!((4..8).all(|x| far[0][5 * side + x] < 0.0 && far[1][5 * side + x] < 0.0), "a wide gap stays open");
+        // through joined(): SegMasks in, SegMasks out, a lone selection unchanged
+        let seg = SegMask::from_logits(side, &l[0]);
+        assert_eq!(joined(vec![seg.clone()]), vec![seg]);
     }
 }

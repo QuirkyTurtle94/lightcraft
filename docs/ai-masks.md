@@ -287,15 +287,20 @@ phrase that names people ("two women", "players", "a group of girls") becomes **
 their own**: up to eight, ordered by how sharp they are (the 90th percentile of fine detail well
 inside them, so the player the camera focused on usually comes first), numbered *person 1, person
 2…*, and the sharpest is chosen already, so **Create mask** right away selects the subject in
-focus. A chosen person is stored as an Object selection with a click inside them, so + / − clicks
-and the detail pass refine that person alone. Other phrases select everything they name, as
+focus. Each person is their share of SAM 3's semantic mask for the phrase (everyone as one mask,
+sure inside; a person's own mask from the detector stays near 0 there and would leave them about
+90 % selected). A chosen person is stored as an Object selection with a click inside them, so + / −
+clicks and the detail pass refine that person alone. Other phrases select everything they name, as
 Describe does. Unmatched phrases and near-identical masks are omitted. Red thumbnails show the
 actual selections. Choose one or more and press **Create mask**: the components are stored
-together in one undoable edit. Background uses the same picker and inverts the union. Cancel leaves
-edits untouched; computation already running finishes in the background. A changed photo cannot
-accept stale suggestions. Existing saved masks are unchanged, and Describe / Object remain
-available. With a remote SAM 3 worker (`LIGHTCRAFT_SAM3_REMOTE`) the picker says it needs the
-local model.
+together in one undoable edit. Where chosen selections touch (people shoulder to shoulder, hands
+on a ball), the seam the model leaves between their soft outlines is closed and each reaches one
+cell into the other, so no line shows between them (clear background, gaps inside one person,
+between the legs, and wider ones between people stay open). Background uses the same picker and
+inverts the union. Cancel leaves edits untouched; computation already running finishes in the
+background. A changed photo cannot accept stale suggestions. Existing saved masks are unchanged,
+and Describe / Object remain available. With a remote SAM 3 worker (`LIGHTCRAFT_SAM3_REMOTE`) the
+picker says it needs the local model.
 
 This is an evaluation interface, not a completed parity feature. The phrase extractor is simple
 (a word list for people, counts and common verbs), BLIP can omit objects or describe them

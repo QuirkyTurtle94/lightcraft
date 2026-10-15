@@ -233,7 +233,8 @@ impl Sam3 {
     }
 
     /// Segment every instance of the concept `text` names, each on its own (best first): the instances
-    /// [`Sam3::segment_text`] would merge.
+    /// [`Sam3::segment_text`] would merge, each with its share of the semantic mask
+    /// ([`detector::share`]).
     pub fn segment_instances(&mut self, enc: &mut Encoded, text: &str, threshold: f32) -> Result<Vec<Prediction>> {
         let out = self.detect(enc, text)?;
         Ok(detector::instances(&out, threshold))
