@@ -232,6 +232,13 @@ impl Sam3 {
         Ok(detector::merge(&out, threshold))
     }
 
+    /// Segment every instance of the concept `text` names, each on its own (best first): the instances
+    /// [`Sam3::segment_text`] would merge.
+    pub fn segment_instances(&mut self, enc: &mut Encoded, text: &str, threshold: f32) -> Result<Vec<Prediction>> {
+        let out = self.detect(enc, text)?;
+        Ok(detector::instances(&out, threshold))
+    }
+
     /// Raw detector outputs for `text` (tests and tools).
     pub fn detect(&mut self, enc: &mut Encoded, text: &str) -> Result<detector::Output> {
         let (det, tok) = self.detector_parts()?;
